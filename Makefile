@@ -1,30 +1,30 @@
-BUILD_DIR = build
+# Application name
+APP_NAME := nsq_exporter
 
-GO       = go
-GOX      = gox
-GOX_ARGS = -output="$(BUILD_DIR)/{{.Dir}}_{{.OS}}_{{.Arch}}" -osarch="linux/amd64 linux/386 linux/arm linux/arm64 darwin/amd64 freebsd/amd64 freebsd/386 windows/386 windows/amd64"
+# Define build directories for each platform
+BUILD_DIR := build
+DARWIN_ARM64_BINARY := $(BUILD_DIR)/$(APP_NAME)-darwin-arm64
+LINUX_AMD64_BINARY := $(BUILD_DIR)/$(APP_NAME)-linux-amd64
 
-.PHONY: build
-build:
-	$(GO) build -o $(BUILD_DIR)/nsq_exporter .
+# Default Go build flags
+GO_BUILD_FLAGS := -ldflags "-s -w"
 
-.PHONY: deps-init deps-get
-deps-init:
-	@go get -u github.com/kardianos/govendor
-	$(GOPATH)/bin/govendor init
+# Build for darwin/arm64
+$(DARWIN_ARM64_BINARY):
+	@echo "Building $(DARWIN_ARM64_BINARY)..."
+	GOOS=darwin GOARCH=arm64 go build $(GO_BUILD_FLAGS) -o $(DARWIN_ARM64_BINARY) .
 
-deps-get: deps-init
-	@$(GOPATH)/bin/govendor get github.com/lovoo/nsq_exporter
+# Build for linux/amd64
+$(LINUX_AMD64_BINARY):
+	@echo "Building $(LINUX_AMD64_BINARY)..."
+	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(LINUX_AMD64_BINARY) .
 
+.PHONY: docker-build-linux
+docker-build-linux: $(LINUX_AMD64_BINARY)
+	docker build --platform=linux/amd64 -t sysfiller/nsq_exporter:latest .
+
+# Clean up binaries
 .PHONY: clean
 clean:
-	rm -R $(BUILD_DIR)/* || true
-
-.PHONY: test
-test:
-	$(GO) test ./...
-
-.PHONY: release-build
-release-build:
-	@go get -u github.com/mitchellh/gox
-	@$(GOX) $(GOX_ARGS) github.com/lovoo/nsq_exporter
+	rm -rf $(BUILD_DIR)
+	@echo "Cleaned up build files."

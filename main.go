@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -130,8 +131,14 @@ func (c *nsqCollector) Collect(ch chan<- prometheus.Metric) {
 	c.inFlightCountGauge.Collect(ch)
 }
 
+var (
+	listenAddress = flag.String("web.listen", ":9117", "Address on which to expose metrics and web interface.")
+	metricsPath   = flag.String("web.path", "/metrics", "Path under which to expose metrics.")
+	nsqdURL       = flag.String("nsqd.addr", "http://localhost:4151/stats", "Address of the nsqd node.")
+)
+
 func (c *nsqCollector) fetchStats() (*Stats, error) {
-	resp, err := http.Get("http://localhost:4151/stats?format=json")
+	resp, err := http.Get(fmt.Sprintf("%s?format=json", *nsqdURL))
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch stats: %v", err)
 	}
@@ -155,6 +162,18 @@ func main() {
 	prometheus.MustRegister(collector)
 
 	// Expose the metrics at /metrics using the updated HandlerFor function
-	http.Handle("/metrics", promhttp.Handler())
-	log.Fatal(http.ListenAndServe(":9117", nil))
+	http.Handle(*metricsPath, promhttp.Handler())
+	if *metricsPath != "" && *metricsPath != "/" {
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html>
+			<head><title>NSQ Exporter</title></head>
+			<body>
+			<h1>NSQ Exporter</h1>
+			<p><a href="` + *metricsPath + `">Metrics</a></p>
+			</body>
+			</html>`))
+		})
+	}
+	log.Printf("Listening on %s\n", *listenAddress)
+	log.Fatal(http.ListenAndServe(*listenAddress, nil))
 }

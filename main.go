@@ -1,115 +1,160 @@
 package main
 
 import (
-	"flag"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
-	"strings"
-
-	"github.com/lovoo/nsq_exporter/collector"
+	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Version of nsq_exporter. Set at build time.
-const Version = "0.0.0.dev"
+type Client struct {
+	ClientID      string `json:"client_id"`
+	Hostname      string `json:"hostname"`
+	Version       string `json:"version"`
+	RemoteAddr    string `json:"remote_address"`
+	ReadyCount    int    `json:"ready_count"`
+	InFlightCount int    `json:"in_flight_count"`
+	MessageCount  int    `json:"message_count"`
+	FinishCount   int    `json:"finish_count"`
+	RequeueCount  int    `json:"requeue_count"`
+}
 
-var (
-	listenAddress     = flag.String("web.listen", ":9117", "Address on which to expose metrics and web interface.")
-	metricsPath       = flag.String("web.path", "/metrics", "Path under which to expose metrics.")
-	nsqdURL           = flag.String("nsqd.addr", "http://localhost:4151/stats", "Address of the nsqd node.")
-	enabledCollectors = flag.String("collect", "stats.topics,stats.channels", "Comma-separated list of collectors to use.")
-	namespace         = flag.String("namespace", "nsq", "Namespace for the NSQ metrics.")
-	tlsCACert         = flag.String("tls.ca_cert", "", "CA certificate file to be used for nsqd connections.")
-	tlsCert           = flag.String("tls.cert", "", "TLS certificate file to be used for client connections to nsqd.")
-	tlsKey            = flag.String("tls.key", "", "TLS key file to be used for TLS client connections to nsqd.")
+type Channel struct {
+	ChannelName   string   `json:"channel_name"`
+	Depth         int      `json:"depth"`
+	BackendDepth  int      `json:"backend_depth"`
+	InFlightCount int      `json:"in_flight_count"`
+	DeferredCount int      `json:"deferred_count"`
+	MessageCount  int      `json:"message_count"`
+	RequeueCount  int      `json:"requeue_count"`
+	TimeoutCount  int      `json:"timeout_count"`
+	ClientCount   int      `json:"client_count"`
+	Clients       []Client `json:"clients"`
+	Paused        bool     `json:"paused"`
+}
 
-	statsRegistry = map[string]func(namespace string) collector.StatsCollector{
-		"topics":   collector.TopicStats,
-		"channels": collector.ChannelStats,
-		"clients":  collector.ClientStats,
+type Topic struct {
+	TopicName string    `json:"topic_name"`
+	Channels  []Channel `json:"channels"`
+}
+
+type Stats struct {
+	Version string  `json:"version"`
+	Topics  []Topic `json:"topics"`
+}
+
+type nsqCollector struct {
+	namespace          string
+	clientCountGauge   *prometheus.GaugeVec
+	messageCountGauge  *prometheus.GaugeVec
+	depthGauge         *prometheus.GaugeVec
+	inFlightCountGauge *prometheus.GaugeVec
+}
+
+func NewNSQCollector(namespace string) *nsqCollector {
+	return &nsqCollector{
+		namespace: namespace,
+		clientCountGauge: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "client_count",
+				Help:      "Number of clients connected to the channel",
+			},
+			[]string{"topic", "channel", "paused"},
+		),
+		messageCountGauge: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "message_count",
+				Help:      "Number of messages in the channel",
+			},
+			[]string{"topic", "channel", "paused"},
+		),
+		depthGauge: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "depth",
+				Help:      "Depth of the channel's queue",
+			},
+			[]string{"topic", "channel", "paused"},
+		),
+		inFlightCountGauge: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "in_flight_count",
+				Help:      "Number of messages currently in-flight in the channel",
+			},
+			[]string{"topic", "channel", "paused"},
+		),
 	}
-)
+}
+
+func (c *nsqCollector) Describe(ch chan<- *prometheus.Desc) {
+	c.clientCountGauge.Describe(ch)
+	c.messageCountGauge.Describe(ch)
+	c.depthGauge.Describe(ch)
+	c.inFlightCountGauge.Describe(ch)
+}
+
+func (c *nsqCollector) Collect(ch chan<- prometheus.Metric) {
+	stats, err := c.fetchStats()
+	if err != nil {
+		log.Println("Error fetching stats:", err)
+		return
+	}
+
+	for _, topic := range stats.Topics {
+		for _, channel := range topic.Channels {
+			labels := prometheus.Labels{
+				"topic":   topic.TopicName,
+				"channel": channel.ChannelName,
+				"paused":  strconv.FormatBool(channel.Paused),
+			}
+
+			// Set gauge values
+			c.clientCountGauge.With(labels).Set(float64(channel.ClientCount))
+			c.messageCountGauge.With(labels).Set(float64(channel.MessageCount))
+			c.depthGauge.With(labels).Set(float64(channel.Depth))
+			c.inFlightCountGauge.With(labels).Set(float64(channel.InFlightCount))
+		}
+	}
+
+	// Collect the metrics
+	c.clientCountGauge.Collect(ch)
+	c.messageCountGauge.Collect(ch)
+	c.depthGauge.Collect(ch)
+	c.inFlightCountGauge.Collect(ch)
+}
+
+func (c *nsqCollector) fetchStats() (*Stats, error) {
+	resp, err := http.Get("http://localhost:4151/stats?format=json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch stats: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var stats Stats
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		return nil, fmt.Errorf("failed to decode stats JSON: %v", err)
+	}
+
+	return &stats, nil
+}
 
 func main() {
-	flag.Parse()
+	namespace := "nsq"
 
-	ex, err := createNsqExecutor()
-	if err != nil {
-		log.Fatalf("error creating nsq executor: %v", err)
-	}
-	prometheus.MustRegister(ex)
+	// Create a new NSQ collector
+	collector := NewNSQCollector(namespace)
 
-	http.Handle(*metricsPath, promhttp.HandlerFor(
-		prometheus.DefaultGatherer,
-		promhttp.HandlerOpts{
-			EnableOpenMetrics: true,
-		}))
-	if *metricsPath != "" && *metricsPath != "/" {
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			w.Write([]byte(`<html>
-			<head><title>NSQ Exporter</title></head>
-			<body>
-			<h1>NSQ Exporter</h1>
-			<p><a href="` + *metricsPath + `">Metrics</a></p>
-			</body>
-			</html>`))
-		})
-	}
+	// Register the collector with Prometheus
+	prometheus.MustRegister(collector)
 
-	log.Print("listening to ", *listenAddress)
-	err = http.ListenAndServe(*listenAddress, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func createNsqExecutor() (*collector.NsqExecutor, error) {
-	nsqdURL, err := normalizeURL(*nsqdURL)
-	if err != nil {
-		return nil, err
-	}
-
-	ex, err := collector.NewNsqExecutor(*namespace, nsqdURL, *tlsCACert, *tlsCert, *tlsKey)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, param := range strings.Split(*enabledCollectors, ",") {
-		param = strings.TrimSpace(param)
-		parts := strings.SplitN(param, ".", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid collector name: %s", param)
-		}
-		if parts[0] != "stats" {
-			return nil, fmt.Errorf("invalid collector prefix: %s", parts[0])
-		}
-
-		name := parts[1]
-		c, has := statsRegistry[name]
-		if !has {
-			return nil, fmt.Errorf("unknown stats collector: %s", name)
-		}
-		ex.Use(c(*namespace))
-	}
-	return ex, nil
-}
-
-func normalizeURL(ustr string) (string, error) {
-	ustr = strings.ToLower(ustr)
-	if !strings.HasPrefix(ustr, "https://") && !strings.HasPrefix(ustr, "http://") {
-		ustr = "http://" + ustr
-	}
-
-	u, err := url.Parse(ustr)
-	if err != nil {
-		return "", err
-	}
-	if u.Path == "" {
-		u.Path = "/stats"
-	}
-	u.RawQuery = "format=json"
-	return u.String(), nil
+	// Expose the metrics at /metrics using the updated HandlerFor function
+	http.Handle("/metrics", promhttp.Handler())
+	log.Fatal(http.ListenAndServe(":9117", nil))
 }
